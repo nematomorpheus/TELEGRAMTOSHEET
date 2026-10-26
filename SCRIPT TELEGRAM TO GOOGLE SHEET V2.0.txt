@@ -1,0 +1,1418 @@
+/**
+ * ============================================================
+ * BOT TELEGRAM -> GOOGLE SHEETS V4 (TANPA CLOUDFLARE)
+ * Telegram Bot API + Google Apps Script + Groq
+ * ============================================================
+ *
+ * POLA WEBHOOK:
+ * Telegram -> Google Apps Script langsung
+ *
+ * PENTING:
+ * - doPost() TIDAK return ContentService/HtmlService
+ * - Pola ini mengikuti script Telegram lama yang sudah terbukti jalan
+ *
+ * FITUR:
+ * - /start
+ * - /ping
+ * - Input transaksi natural language
+ * - Groq parsing transaksi
+ * - Simpan otomatis ke Google Sheets
+ * - Balasan sukses/error ke Telegram
+ * - Anti duplikat update Telegram
+ */
+
+const CONFIG = {
+  TELEGRAM_BOT_TOKEN: 'MASUKKAN_BOT_TOKEN_TELEGRAM',
+  GROQ_API_KEY: 'MASUKKAN_API_KEY_GROQ',
+
+  // WAJIB URL Web App hasil Deploy yang berakhir /exec
+  WEB_APP_URL: 'MASUKKAN_WEB_APP_URL_EXEC',
+
+  GROQ_MODEL: 'llama-3.3-70b-versatile',
+
+  SHEET_NAME: 'Transaksi',
+  TIME_ZONE: 'Asia/Jakarta',
+
+  GROQ_API_URL: 'https://api.groq.com/openai/v1/chat/completions'
+};
+
+
+// ============================================================
+// WEBHOOK TELEGRAM
+// ============================================================
+
+function doPost(e) {
+  var chatId = '';
+
+  try {
+    if (
+      !e ||
+      !e.postData ||
+      !e.postData.contents
+    ) {
+      Logger.log('POST kosong.');
+      return;
+    }
+
+    var update =
+      JSON.parse(
+        e.postData.contents
+      );
+
+    Logger.log(
+      'Update Telegram: ' +
+      JSON.stringify(update)
+    );
+
+    if (
+      isDuplicateTelegramUpdate(
+        update
+      )
+    ) {
+      Logger.log(
+        'Duplicate update diabaikan.'
+      );
+      return;
+    }
+
+    var msg =
+      update.message ||
+      update.edited_message ||
+      null;
+
+    if (!msg) {
+      Logger.log(
+        'Update bukan message.'
+      );
+      return;
+    }
+
+    chatId =
+      msg.chat &&
+      msg.chat.id
+        ? String(msg.chat.id)
+        : '';
+
+    var text =
+      String(
+        msg.text ||
+        msg.caption ||
+        ''
+      ).trim();
+
+    if (!chatId) {
+      Logger.log(
+        'Chat ID tidak ditemukan.'
+      );
+      return;
+    }
+
+    // ========================================================
+    // COMMAND /start
+    // ========================================================
+
+    if (
+      text === '/start' ||
+      text.indexOf('/start@') === 0
+    ) {
+      sendTelegramMessage(
+        chatId,
+        '✅ <b>Bot Telegram aktif.</b>\n\n' +
+        'Silakan kirim transaksi, contoh:\n' +
+        '<code>Beli makan siang 25000 pakai BCA</code>',
+        msg.message_id
+      );
+
+      return;
+    }
+
+
+    // ========================================================
+    // COMMAND /ping
+    // ========================================================
+
+    if (
+      text === '/ping' ||
+      text.indexOf('/ping@') === 0
+    ) {
+      sendTelegramMessage(
+        chatId,
+        '🏓 Pong! Telegram → Apps Script aktif.',
+        msg.message_id
+      );
+
+      return;
+    }
+
+
+    // ========================================================
+    // PESAN KOSONG
+    // ========================================================
+
+    if (!text) {
+      return;
+    }
+
+
+    // ========================================================
+    // GROQ PARSING
+    // ========================================================
+
+    var transaction =
+      analyzeTransactionWithGroq(
+        text
+      );
+
+    if (
+      !transaction.is_transaction
+    ) {
+      sendTelegramMessage(
+        chatId,
+        '⚠️ Pesan belum dikenali sebagai transaksi.\n\n' +
+        'Contoh:\n' +
+        '<code>Beli makan siang 25000 pakai BCA</code>',
+        msg.message_id
+      );
+
+      return;
+    }
+
+
+    // ========================================================
+    // SIMPAN GOOGLE SHEET
+    // ========================================================
+
+    var senderInfo =
+      getTelegramSenderInfo(
+        msg
+      );
+
+    var id =
+      saveTransaction(
+        transaction,
+        text,
+        senderInfo
+      );
+
+
+    // ========================================================
+    // BALAS SUKSES
+    // ========================================================
+
+    var reply =
+      '✅ <b>DATA BERHASIL DISIMPAN</b>\n' +
+      '━━━━━━━━━━━━━━━━━━\n' +
+      '🆔 ' +
+      escapeHtml(id) +
+      '\n' +
+      '📅 ' +
+      escapeHtml(
+        formatIndonesianDate(
+          parseYmdDate(
+            transaction
+              .transaction_date
+          )
+        )
+      ) +
+      '\n' +
+      '📂 ' +
+      escapeHtml(
+        transaction.category
+      ) +
+      '\n' +
+      '📝 ' +
+      escapeHtml(
+        transaction.description
+      ) +
+      '\n' +
+      '💰 <b>' +
+      escapeHtml(
+        formatRupiah(
+          transaction.amount
+        )
+      ) +
+      '</b>\n' +
+      '💳 ' +
+      escapeHtml(
+        transaction
+          .payment_method
+      );
+
+    sendTelegramMessage(
+      chatId,
+      reply,
+      msg.message_id
+    );
+
+  } catch (error) {
+    Logger.log(
+      'ERROR doPost: ' +
+      error.message
+    );
+
+    Logger.log(
+      error.stack || ''
+    );
+
+    if (chatId) {
+      try {
+        sendTelegramMessage(
+          chatId,
+          '❌ <b>Terjadi kesalahan</b>\n\n' +
+          escapeHtml(
+            error.message
+          )
+        );
+      } catch (sendError) {
+        Logger.log(
+          'Gagal kirim error: ' +
+          sendError.message
+        );
+      }
+    }
+  }
+
+  // PENTING:
+  // JANGAN return ContentService atau HtmlService di sini.
+}
+
+
+// ============================================================
+// TEST BROWSER
+// ============================================================
+
+function doGet(e) {
+  return HtmlService
+    .createHtmlOutput(
+      '<h3>Bot Telegram → Google Sheets V4 aktif.</h3>' +
+      '<p>Webhook siap menerima POST dari Telegram.</p>'
+    );
+}
+
+
+// ============================================================
+// ANTI DUPLIKAT
+// ============================================================
+
+function isDuplicateTelegramUpdate(
+  update
+) {
+  var cache =
+    CacheService
+      .getScriptCache();
+
+  var updateId =
+    update &&
+    update.update_id !== undefined
+      ? String(
+          update.update_id
+        )
+      : '';
+
+  if (!updateId) {
+    return false;
+  }
+
+  var key =
+    'TG_UPDATE_' +
+    updateId;
+
+  if (
+    cache.get(key)
+  ) {
+    return true;
+  }
+
+  cache.put(
+    key,
+    '1',
+    600
+  );
+
+  return false;
+}
+
+
+// ============================================================
+// INFO SENDER
+// ============================================================
+
+function getTelegramSenderInfo(
+  msg
+) {
+  var from =
+    msg.from || {};
+
+  return {
+    user_id:
+      from.id
+        ? String(from.id)
+        : '',
+
+    username:
+      from.username || '',
+
+    first_name:
+      from.first_name || '',
+
+    last_name:
+      from.last_name || '',
+
+    chat_id:
+      msg.chat &&
+      msg.chat.id
+        ? String(
+            msg.chat.id
+          )
+        : '',
+
+    chat_type:
+      msg.chat &&
+      msg.chat.type
+        ? msg.chat.type
+        : ''
+  };
+}
+
+
+// ============================================================
+// GROQ AI
+// ============================================================
+
+function analyzeTransactionWithGroq(
+  message
+) {
+  assertGroqConfigured();
+
+  var today =
+    Utilities.formatDate(
+      new Date(),
+      CONFIG.TIME_ZONE,
+      'yyyy-MM-dd'
+    );
+
+  var systemPrompt =
+    'Kamu adalah parser transaksi keuangan berbahasa Indonesia.\n' +
+    'Tanggal hari ini: ' +
+    today +
+    '.\n\n' +
+
+    'Balas HANYA JSON valid tanpa markdown.\n\n' +
+
+    'Format wajib:\n' +
+    '{\n' +
+    '  "is_transaction": true,\n' +
+    '  "type": "Pengeluaran",\n' +
+    '  "category": "Makanan",\n' +
+    '  "description": "Makan siang",\n' +
+    '  "amount": 20000,\n' +
+    '  "payment_method": "BCA",\n' +
+    '  "transaction_date": "' +
+    today +
+    '"\n' +
+    '}\n\n' +
+
+    'Aturan:\n' +
+    '1. Jika bukan transaksi, isi is_transaction=false.\n' +
+    '2. type hanya Pemasukan atau Pengeluaran.\n' +
+    '3. amount harus angka. Contoh 20rb menjadi 20000.\n' +
+    '4. Jika metode pembayaran tidak disebut, isi "Tidak diketahui".\n' +
+    '5. Jika kategori tidak jelas, isi "Lainnya".\n' +
+    '6. transaction_date harus yyyy-MM-dd.\n' +
+    '7. Jika tanggal tidak disebut, gunakan tanggal hari ini.';
+
+  var requestBody = {
+    model:
+      CONFIG.GROQ_MODEL,
+
+    messages: [
+      {
+        role: 'system',
+        content:
+          systemPrompt
+      },
+      {
+        role: 'user',
+        content:
+          message
+      }
+    ],
+
+    temperature: 0.1,
+
+    max_tokens: 500,
+
+    response_format: {
+      type: 'json_object'
+    }
+  };
+
+  var response =
+    UrlFetchApp.fetch(
+      CONFIG.GROQ_API_URL,
+      {
+        method:
+          'post',
+
+        contentType:
+          'application/json',
+
+        headers: {
+          Authorization:
+            'Bearer ' +
+            CONFIG.GROQ_API_KEY
+        },
+
+        payload:
+          JSON.stringify(
+            requestBody
+          ),
+
+        muteHttpExceptions:
+          true
+      }
+    );
+
+  var status =
+    response
+      .getResponseCode();
+
+  var text =
+    response
+      .getContentText();
+
+  if (
+    status < 200 ||
+    status >= 300
+  ) {
+    throw new Error(
+      'Groq API error ' +
+      status +
+      ': ' +
+      text
+    );
+  }
+
+  var outer =
+    JSON.parse(
+      text
+    );
+
+  if (
+    !outer.choices ||
+    !outer.choices[0] ||
+    !outer.choices[0].message
+  ) {
+    throw new Error(
+      'Respons Groq tidak valid.'
+    );
+  }
+
+  var content =
+    outer
+      .choices[0]
+      .message
+      .content;
+
+  var parsed =
+    JSON.parse(
+      extractJson(
+        content
+      )
+    );
+
+  return normalizeTransaction(
+    parsed
+  );
+}
+
+
+function assertGroqConfigured() {
+  if (
+    !CONFIG.GROQ_API_KEY ||
+    CONFIG.GROQ_API_KEY ===
+      'MASUKKAN_API_KEY_GROQ'
+  ) {
+    throw new Error(
+      'GROQ_API_KEY belum diisi.'
+    );
+  }
+}
+
+
+function extractJson(text) {
+  var raw =
+    String(
+      text || ''
+    ).trim();
+
+  var first =
+    raw.indexOf('{');
+
+  var last =
+    raw.lastIndexOf('}');
+
+  if (
+    first === -1 ||
+    last === -1 ||
+    last < first
+  ) {
+    throw new Error(
+      'JSON tidak ditemukan dalam respons Groq.'
+    );
+  }
+
+  return raw.substring(
+    first,
+    last + 1
+  );
+}
+
+
+function normalizeTransaction(
+  transaction
+) {
+  var isTransaction =
+    transaction
+      .is_transaction === true ||
+    String(
+      transaction
+        .is_transaction
+    ).toLowerCase() ===
+      'true';
+
+  if (
+    !isTransaction
+  ) {
+    return {
+      is_transaction:
+        false
+    };
+  }
+
+  var amount =
+    parseAmount(
+      transaction.amount
+    );
+
+  if (
+    amount <= 0
+  ) {
+    throw new Error(
+      'Nominal transaksi tidak valid.'
+    );
+  }
+
+  var type =
+    isIncomeType(
+      transaction.type
+    )
+      ? 'Pemasukan'
+      : 'Pengeluaran';
+
+  var date =
+    String(
+      transaction
+        .transaction_date ||
+      ''
+    ).trim();
+
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/
+      .test(date)
+  ) {
+    date =
+      Utilities.formatDate(
+        new Date(),
+        CONFIG.TIME_ZONE,
+        'yyyy-MM-dd'
+      );
+  }
+
+  return {
+    is_transaction:
+      true,
+
+    type:
+      type,
+
+    category:
+      String(
+        transaction.category ||
+        'Lainnya'
+      ).trim(),
+
+    description:
+      String(
+        transaction.description ||
+        'Transaksi'
+      ).trim(),
+
+    amount:
+      amount,
+
+    payment_method:
+      String(
+        transaction
+          .payment_method ||
+        'Tidak diketahui'
+      ).trim(),
+
+    transaction_date:
+      date
+  };
+}
+
+
+// ============================================================
+// GOOGLE SHEETS
+// ============================================================
+
+function setupSheet() {
+  var sheet =
+    getOrCreateSheet();
+
+  SpreadsheetApp
+    .getActiveSpreadsheet()
+    .toast(
+      'Sheet transaksi siap.'
+    );
+
+  Logger.log(
+    'Sheet siap: ' +
+    sheet.getName()
+  );
+}
+
+
+function getOrCreateSheet() {
+  var ss =
+    SpreadsheetApp
+      .getActiveSpreadsheet();
+
+  var sheet =
+    ss.getSheetByName(
+      CONFIG.SHEET_NAME
+    );
+
+  if (!sheet) {
+    sheet =
+      ss.insertSheet(
+        CONFIG.SHEET_NAME
+      );
+  }
+
+  if (
+    sheet.getLastRow() === 0
+  ) {
+    var headers = [
+      'ID',
+      'Timestamp',
+      'Tanggal',
+      'Jenis',
+      'Kategori',
+      'Keterangan',
+      'Nominal',
+      'Metode',
+      'Telegram User ID',
+      'Username',
+      'Nama',
+      'Chat ID',
+      'Chat Type',
+      'Pesan Asli'
+    ];
+
+    sheet
+      .getRange(
+        1,
+        1,
+        1,
+        headers.length
+      )
+      .setValues([
+        headers
+      ]);
+
+    sheet
+      .getRange(
+        1,
+        1,
+        1,
+        headers.length
+      )
+      .setFontWeight(
+        'bold'
+      );
+
+    sheet
+      .setFrozenRows(
+        1
+      );
+  }
+
+  return sheet;
+}
+
+
+function saveTransaction(
+  transaction,
+  originalMessage,
+  senderInfo
+) {
+  var sheet =
+    getOrCreateSheet();
+
+  var date =
+    parseYmdDate(
+      transaction
+        .transaction_date
+    );
+
+  var id =
+    generateTransactionId(
+      date
+    );
+
+  var fullName =
+    [
+      senderInfo
+        .first_name,
+
+      senderInfo
+        .last_name
+    ]
+      .filter(
+        Boolean
+      )
+      .join(' ');
+
+  sheet.appendRow([
+    id,
+    new Date(),
+    date,
+    transaction.type,
+    transaction.category,
+    transaction.description,
+    transaction.amount,
+    transaction.payment_method,
+    senderInfo.user_id,
+    senderInfo.username,
+    fullName,
+    senderInfo.chat_id,
+    senderInfo.chat_type,
+    originalMessage
+  ]);
+
+  var row =
+    sheet.getLastRow();
+
+  sheet
+    .getRange(
+      row,
+      2
+    )
+    .setNumberFormat(
+      'dd/MM/yyyy HH:mm:ss'
+    );
+
+  sheet
+    .getRange(
+      row,
+      3
+    )
+    .setNumberFormat(
+      'dd/MM/yyyy'
+    );
+
+  sheet
+    .getRange(
+      row,
+      7
+    )
+    .setNumberFormat(
+      '"Rp"#,##0'
+    );
+
+  return id;
+}
+
+
+function generateTransactionId(
+  date
+) {
+  var day =
+    Utilities.formatDate(
+      date,
+      CONFIG.TIME_ZONE,
+      'yyyyMMdd'
+    );
+
+  var random =
+    Math.floor(
+      100000 +
+      Math.random() *
+      900000
+    );
+
+  return (
+    'TRX-' +
+    day +
+    '-' +
+    random
+  );
+}
+
+
+// ============================================================
+// TELEGRAM API
+// ============================================================
+
+function sendTelegramMessage(
+  chatId,
+  message,
+  replyToMessageId
+) {
+  assertTelegramConfigured();
+
+  var url =
+    'https://api.telegram.org/bot' +
+    CONFIG.TELEGRAM_BOT_TOKEN +
+    '/sendMessage';
+
+  var data = {
+    chat_id:
+      chatId,
+
+    text:
+      message,
+
+    parse_mode:
+      'HTML'
+  };
+
+  if (
+    replyToMessageId
+  ) {
+    data.reply_to_message_id =
+      replyToMessageId;
+  }
+
+  var response =
+    UrlFetchApp.fetch(
+      url,
+      {
+        method:
+          'post',
+
+        contentType:
+          'application/json',
+
+        payload:
+          JSON.stringify(
+            data
+          ),
+
+        muteHttpExceptions:
+          true
+      }
+    );
+
+  var status =
+    response
+      .getResponseCode();
+
+  var body =
+    response
+      .getContentText();
+
+  if (
+    status < 200 ||
+    status >= 300
+  ) {
+    throw new Error(
+      'Telegram API error ' +
+      status +
+      ': ' +
+      body
+    );
+  }
+
+  return body;
+}
+
+
+function assertTelegramConfigured() {
+  if (
+    !CONFIG.TELEGRAM_BOT_TOKEN ||
+    CONFIG.TELEGRAM_BOT_TOKEN ===
+      'MASUKKAN_BOT_TOKEN_TELEGRAM'
+  ) {
+    throw new Error(
+      'TELEGRAM_BOT_TOKEN belum diisi.'
+    );
+  }
+}
+
+
+// ============================================================
+// WEBHOOK SETUP LANGSUNG KE GOOGLE APPS SCRIPT
+// ============================================================
+
+function setTelegramWebhook() {
+  assertTelegramConfigured();
+
+  if (
+    !CONFIG.WEB_APP_URL ||
+    CONFIG.WEB_APP_URL ===
+      'MASUKKAN_WEB_APP_URL_EXEC' ||
+    CONFIG.WEB_APP_URL
+      .indexOf('/exec') === -1
+  ) {
+    throw new Error(
+      'WEB_APP_URL belum benar. Gunakan URL deployment yang berakhir /exec.'
+    );
+  }
+
+  var url =
+    'https://api.telegram.org/bot' +
+    CONFIG.TELEGRAM_BOT_TOKEN +
+    '/setWebhook';
+
+  var response =
+    UrlFetchApp.fetch(
+      url,
+      {
+        method:
+          'post',
+
+        contentType:
+          'application/json',
+
+        payload:
+          JSON.stringify({
+            url:
+              CONFIG.WEB_APP_URL,
+
+            drop_pending_updates:
+              true
+          }),
+
+        muteHttpExceptions:
+          true
+      }
+    );
+
+  var body =
+    response
+      .getContentText();
+
+  Logger.log(
+    body
+  );
+
+  return body;
+}
+
+
+function getTelegramWebhookInfo() {
+  assertTelegramConfigured();
+
+  var url =
+    'https://api.telegram.org/bot' +
+    CONFIG.TELEGRAM_BOT_TOKEN +
+    '/getWebhookInfo';
+
+  var response =
+    UrlFetchApp.fetch(
+      url,
+      {
+        muteHttpExceptions:
+          true
+      }
+    );
+
+  var body =
+    response
+      .getContentText();
+
+  Logger.log(
+    body
+  );
+
+  return body;
+}
+
+
+function deleteTelegramWebhook() {
+  assertTelegramConfigured();
+
+  var url =
+    'https://api.telegram.org/bot' +
+    CONFIG.TELEGRAM_BOT_TOKEN +
+    '/deleteWebhook';
+
+  var response =
+    UrlFetchApp.fetch(
+      url,
+      {
+        method:
+          'post',
+
+        contentType:
+          'application/json',
+
+        payload:
+          JSON.stringify({
+            drop_pending_updates:
+              true
+          }),
+
+        muteHttpExceptions:
+          true
+      }
+    );
+
+  var body =
+    response
+      .getContentText();
+
+  Logger.log(
+    body
+  );
+
+  return body;
+}
+
+
+// ============================================================
+// TEST
+// ============================================================
+
+function testGroq() {
+  var result =
+    analyzeTransactionWithGroq(
+      'Beli makan siang 25000 pakai BCA'
+    );
+
+  Logger.log(
+    JSON.stringify(
+      result,
+      null,
+      2
+    )
+  );
+}
+
+
+function testTelegramSend() {
+  // Isi Chat ID sementara untuk tes manual.
+  var chatId =
+    'MASUKKAN_CHAT_ID';
+
+  sendTelegramMessage(
+    chatId,
+    '✅ Test Telegram berhasil.'
+  );
+}
+
+
+// ============================================================
+// UTILS
+// ============================================================
+
+function parseAmount(value) {
+  if (
+    typeof value ===
+      'number'
+  ) {
+    return Math.abs(
+      value
+    );
+  }
+
+  var text =
+    String(
+      value || ''
+    )
+      .toLowerCase()
+      .trim();
+
+  if (!text) {
+    return 0;
+  }
+
+  var multiplier =
+    1;
+
+  if (
+    text.indexOf(
+      'juta'
+    ) !== -1 ||
+    /jt\b/.test(
+      text
+    )
+  ) {
+    multiplier =
+      1000000;
+
+  } else if (
+    text.indexOf(
+      'ribu'
+    ) !== -1 ||
+    /rb\b/.test(
+      text
+    ) ||
+    /k\b/.test(
+      text
+    )
+  ) {
+    multiplier =
+      1000;
+  }
+
+  text =
+    text
+      .replace(
+        /rp/gi,
+        ''
+      )
+      .replace(
+        /juta/gi,
+        ''
+      )
+      .replace(
+        /jt/gi,
+        ''
+      )
+      .replace(
+        /ribu/gi,
+        ''
+      )
+      .replace(
+        /rb/gi,
+        ''
+      )
+      .replace(
+        /k/gi,
+        ''
+      )
+      .replace(
+        /\s/g,
+        ''
+      );
+
+  if (
+    multiplier > 1
+  ) {
+    text =
+      text.replace(
+        ',',
+        '.'
+      );
+
+    var n =
+      parseFloat(
+        text.replace(
+          /[^\d.]/g,
+          ''
+        )
+      );
+
+    return isNaN(n)
+      ? 0
+      : Math.round(
+          n *
+          multiplier
+        );
+  }
+
+  var cleaned =
+    text
+      .replace(
+        /\./g,
+        ''
+      )
+      .replace(
+        /,/g,
+        ''
+      )
+      .replace(
+        /[^\d]/g,
+        ''
+      );
+
+  var number =
+    Number(
+      cleaned
+    );
+
+  return isNaN(
+    number
+  )
+    ? 0
+    : Math.abs(
+        number
+      );
+}
+
+
+function isIncomeType(type) {
+  var text =
+    String(
+      type || ''
+    ).toLowerCase();
+
+  return (
+    text.indexOf(
+      'pemasukan'
+    ) !== -1 ||
+
+    text.indexOf(
+      'income'
+    ) !== -1 ||
+
+    text.indexOf(
+      'pendapatan'
+    ) !== -1 ||
+
+    text.indexOf(
+      'gaji'
+    ) !== -1 ||
+
+    text.indexOf(
+      'bonus'
+    ) !== -1 ||
+
+    text.indexOf(
+      'terima'
+    ) !== -1
+  );
+}
+
+
+function formatRupiah(value) {
+  var number =
+    Math.round(
+      Number(value) ||
+      0
+    );
+
+  return (
+    'Rp' +
+    Math.abs(
+      number
+    )
+      .toString()
+      .replace(
+        /\B(?=(\d{3})+(?!\d))/g,
+        '.'
+      )
+  );
+}
+
+
+function parseYmdDate(ymd) {
+  var match =
+    String(
+      ymd || ''
+    ).match(
+      /^(\d{4})-(\d{2})-(\d{2})$/
+    );
+
+  if (!match) {
+    return new Date();
+  }
+
+  return new Date(
+    Number(
+      match[1]
+    ),
+    Number(
+      match[2]
+    ) - 1,
+    Number(
+      match[3]
+    ),
+    12,
+    0,
+    0
+  );
+}
+
+
+function formatIndonesianDate(date) {
+  var months = [
+    'Januari',
+    'Februari',
+    'Maret',
+    'April',
+    'Mei',
+    'Juni',
+    'Juli',
+    'Agustus',
+    'September',
+    'Oktober',
+    'November',
+    'Desember'
+  ];
+
+  var day =
+    Utilities.formatDate(
+      date,
+      CONFIG.TIME_ZONE,
+      'dd'
+    );
+
+  var month =
+    Number(
+      Utilities.formatDate(
+        date,
+        CONFIG.TIME_ZONE,
+        'M'
+      )
+    );
+
+  var year =
+    Utilities.formatDate(
+      date,
+      CONFIG.TIME_ZONE,
+      'yyyy'
+    );
+
+  return (
+    day +
+    ' ' +
+    months[
+      month - 1
+    ] +
+    ' ' +
+    year
+  );
+}
+
+
+function escapeHtml(text) {
+  return String(
+    text || ''
+  )
+    .replace(
+      /&/g,
+      '&amp;'
+    )
+    .replace(
+      /</g,
+      '&lt;'
+    )
+    .replace(
+      />/g,
+      '&gt;'
+    )
+    .replace(
+      /"/g,
+      '&quot;'
+    )
+    .replace(
+      /'/g,
+      '&#039;'
+    );
+}
